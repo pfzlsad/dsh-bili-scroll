@@ -30,6 +30,10 @@ import { fileURLToPath } from 'node:url'
 import { McpClient } from './lib/mcp.mjs'
 import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey } from './lib/state.mjs'
+import {
+  ensurePersona, personaPaths, tailLines, snapshotSelf, validateSelfUpdate,
+  rollbackSelf, resetSelf, appendSaid, personaInfo, SELF_MAX,
+} from './lib/persona.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 
@@ -88,6 +92,8 @@ export const Config = !z ? undefined : z.object({
   replyPerRound: z.number().default(1).extra('volatile', true),
   /** 自动收藏：0 = 不收藏；>0 = 目标收藏夹 fid（设置页下拉选）。动作在宿主侧完成，模型拿不到这只手 */
   favFolderId: z.number().default(0).extra('volatile', true),
+  /** ⭐ 人格自进化：刷完之后要不要让它更新「我是谁」那份档案（默认关 —— 产物会直接变成评论） */
+  personaEvolve: z.boolean().default(false).extra('volatile', true),
 })
 
 /**
@@ -198,6 +204,7 @@ export function apply(ctx, config) {
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
     dmMode: 'off', dmUid: 0,
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    personaEvolve: false,
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -232,6 +239,7 @@ export function apply(ctx, config) {
     if ('replyPerRound' in p) p.replyPerRound = Math.max(1, Math.min(Number(p.replyPerRound) || 1, 10))
     if ('favFolderId' in p) p.favFolderId = Math.max(0, Math.floor(Number(p.favFolderId) || 0))
     if ('commentPerRound' in p) p.commentPerRound = Math.max(0, Math.min(Number(p.commentPerRound) || 0, 20))
+    if ('personaEvolve' in p) p.personaEvolve = Boolean(p.personaEvolve)
     return p
   }
 
@@ -398,6 +406,10 @@ export function apply(ctx, config) {
   // ⭐ 值班章程单独记账（跟 mcp_server.py 不一样：用户改过就得留着 —— 见 state.mjs 的 ensureCharter）
   ensureCharter(pluginDir, stateDir, log)
 
+  // ⭐ 人格档案（0.2.0）：目录和空文件必须**宿主先建好** —— 那一轮被沙箱关着，新建目录会被拒 ✗
+  //    这里只铺空模板，绝不碰使用者的 AGENTS.md（那是他的红线，我们只读）。
+  ensurePersona(stateDir, log)
+
   /* ─────────────── MCP（内部起那个 Python MCP） ─────────────── */
 
   let mcp = null
@@ -528,11 +540,19 @@ export function apply(ctx, config) {
             : '要发评论得同时满足两条：设置里开着「自动评论并 @ 你」、并且填了「要 @ 谁」。或者本人当场让你发时传 force: true。',
         }
       }
-      return call('bili_reply', {
+      const r = await call('bili_reply', {
         bvid: String(args.bvid ?? ''),
         text: String(args.text ?? ''),
         rpid: Number(args.rpid) || 0,
       })
+      // ⭐ 记下"我说过的话"（评论全文）—— 判重表只存了前 20 字，做不了"开头别重复"的检查
+      //    ⚠️ 那一轮（headless）走的是 MCP 里那只 bili_reply，宿主管不到 ⇒ 章程里让它自己也记一行
+      try {
+        const o = (r && typeof r === 'object') ? r : {}
+        const rpid = Number(o.rpid ?? o.data?.rpid ?? o.result?.rpid ?? 0) || 0
+        appendSaid(stateDir, { bvid: String(args.bvid ?? ''), rpid, text: String(args.text ?? '') })
+      } catch { /* 记不上不影响发评论 */ }
+      return r
     },
   })
 
@@ -845,6 +865,26 @@ export function apply(ctx, config) {
           + '\n===== 设定结束 =====\n'
       }
     } catch { /* 读不到就算了，别因此跑不成 */ }
+    /**
+     * ⭐ 人格档案（0.2.0）：把「它是谁 / 最近看过什么 / 最近说过什么」一起喂进去。
+     *    为什么这三样缺一不可：① 只有档案 ⇒ 像在背人设；② 只有日记 ⇒ 像流水账；
+     *    ③ 没有"最近说过的话" ⇒ 每轮都用同一个开头（「@某人 这期值得看：…」就是这么来的）。
+     *    关着（默认）就一个字都不注入 —— 回到 0.1.x 的行为，老用户零感知。
+     */
+    const pp = personaPaths(stateDir)
+    let personaDoc = ''
+    if (cfg.personaEvolve) {
+      try {
+        const selfText = readFileSync(pp.self, 'utf8').trim()
+        const journal = tailLines(pp.journal, 8)
+        const said = tailLines(pp.said, 5)
+        personaDoc = '\n\n===== 我自己的档案（这是「我」，不是使用者的设定）=====\n'
+          + selfText
+          + '\n===== 档案结束 =====\n'
+          + (journal.length ? '\n===== 我最近真的看过的（观影日记，最近几条）=====\n' + journal.join('\n') + '\n' : '')
+          + (said.length ? '\n===== 我最近发过的评论（开头 / 句式别跟它们一样）=====\n' + said.join('\n') + '\n' : '')
+      } catch { /* 读不到就当没有，别因此跑不成 */ }
+    }
     // ⭐ 「每天最多挑 N 条」是**全天**的账：上一轮已经挑过的要扣掉，这一轮只给剩下的额度
     const quota = Math.max(0, Number(cfg.perDay) || 0)
     const already = countPickedToday()
@@ -859,6 +899,17 @@ export function apply(ctx, config) {
       + (ownerDoc
         ? ''
         : '⭐ 这一轮**没有**拿到使用者的设定（他没填「工作区」，或那个目录里没有 `AGENTS.md`）⇒ **按中性说话**：别扮演任何人、也别自己编一套设定 ✓。')
+      + personaDoc
+      + (cfg.personaEvolve
+        ? `\n===== 人格维护（这一轮刷完做，别跳过）=====\n`
+          + `① 日记：往 ${pp.journal} 追加今天**真的看进去**的一两行，格式 \`- 月-日 · BV号 · 我点进去是想看…；看到…的时候我…\`（每行 ≤60 字，跳过的不写）。\n`
+          + `② 档案：改 ${pp.self} **最多 2 处**（加一行就删一行）；每处在 ${pp.changelog} 记「改了哪句 / 哪条 BV / 为什么」。\n`
+          + `③ 只写"看过什么、怎么想"：**不编现实身份 / 经历**，不写 @，不动使用者的 AGENTS.md。\n`
+          + `④ 可替换性测试：新写的句子「换给任何账号都成立」⇒ 删掉。只有"我"会这么说，才算数。\n`
+          + `⑤ 发了评论：把全文追加到 ${pp.said}（\`- 时间 · BV · rpid · 正文\`）—— 下一轮靠它避免重复自己。\n`
+          + `⑥ 评论自查：换个人能不能说？有没有只有看了这条才写得出的细节？开头跟最近 5 条重不重？不合格就不发。\n`
+          + `评论要用上面这份档案的口吻写；宿主管家会校验档案（大小 / 改动行数 / 有没有 @），过不了会被回滚。\n`
+        : '')
       + (charterText
           ? '下面是**值班章程**（里面的「<家目录>」已经替换成真实绝对路径了）—— 严格按它执行：\n\n'
             + charterText + '\n\n按上面的章程刷一轮 B站，'
@@ -886,7 +937,7 @@ export function apply(ctx, config) {
       + ` —— 一行一条：日期 · BV 号 · 标题 · UP · 一句话结论 · 链接（跳过的那条在后面注明理由）；`
       + `这是**给以后检索用**的（报告是给人看的，归档是给"回头翻"用的），别省略、也别只写挑中的。`
       + `自动评论并 @ ${cfg.mentionName || '（还没填要 @ 谁）'} 是${commentOn
-        ? `开着的（每轮最多 ${cfg.commentPerRound} 条评论，每条在正文里纯文本 @ ${cfg.mentionName}，150 字内）`
+        ? `开着的（每轮最多 ${cfg.commentPerRound} 条评论，150 字内；正文里要不要写 @ 按章程来）`
         : (cfg.dmMode === 'only'
           ? '关着的 —— 当前是「**只私信**」模式：**这一轮一条公开评论都不许发**，改走私信'
           : '关着的（只写报告，别发评论）')}。`
@@ -1072,6 +1123,8 @@ export function apply(ctx, config) {
     //      现在改成"设定由插件读进来、内联进提示词" ✓，cwd 回到插件家 ✓）
     const cwd = stateDir
     log(`刷B站开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
+    // ⭐ 人格档案：开跑前拍一张（跑完拿它校验 / 回滚）—— 关着就不拍，一分钱都不多花
+    const personaBefore = cfg.personaEvolve ? snapshotSelf(stateDir) : null
     const child = spawn(dsh.command, args, {
       cwd,
       shell: dsh.shell,
@@ -1106,6 +1159,14 @@ export function apply(ctx, config) {
     child.on('exit', (code) => {
       log(`刷B站结束（${why}，code=${code}）`)
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
+      // ⭐ 人格档案：模型再飘也飘不出边界 —— 太长 / 改太猛 / 写了 @ / 结构被拆 ⇒ 回滚
+      if (personaBefore !== null) {
+        try {
+          const v = validateSelfUpdate(stateDir, personaBefore)
+          if (!v.ok) log(`人格档案这一轮改得不合规，已回滚：${v.why}${v.rejected ? `（被拒的那版留在 ${v.rejected}）` : ''}`)
+          else if (v.changed) log(`人格档案更新了 ${v.changed} 行（现在 ${v.chars} 字）`)
+        } catch (e) { log('校验人格档案时出错（不影响这一轮）：' + (e?.message ?? e)) }
+      }
     // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
     if (code === 0 && Number(cfg.favFolderId) > 0) {
       favToday('auto').catch((error) => log('自动收藏出错（已兜住）：' + String(error?.message ?? error)))
@@ -1580,12 +1641,30 @@ export function apply(ctx, config) {
       return sendJson(res, 200, { ok: true, config: cfg, windows: WINDOWS, home: stateDir })
     }
 
+    // ⭐ 人格档案（设置页「它自己的那份」）：读 / 回退 / 重置。
+    //    正文单独一个接口 —— /status 是每 5 秒拉一次的，别把几千字塞进去。
+    if (req.method === 'GET' && path === '/api/bili-duty/persona') {
+      return sendJson(res, 200, { ok: true, enabled: Boolean(cfg.personaEvolve), max: SELF_MAX, ...personaInfo(stateDir) })
+    }
+    if (req.method === 'POST' && path === '/api/bili-duty/persona/rollback') {
+      const r = rollbackSelf(stateDir)
+      if (!r.ok) return sendJson(res, 200, { ok: false, error: r.error })
+      log(`人格档案已回退（恢复自 ${r.from}）`)
+      return sendJson(res, 200, { ok: true, note: `已恢复 ${r.from}`, persona: personaInfo(stateDir) })
+    }
+    if (req.method === 'POST' && path === '/api/bili-duty/persona/reset') {
+      const r = resetSelf(stateDir)
+      if (!r.ok) return sendJson(res, 200, { ok: false, error: r.error })
+      log('人格档案已重置为空白模板（旧的那份留在 .history 里）')
+      return sendJson(res, 200, { ok: true, note: '已重置', persona: personaInfo(stateDir) })
+    }
+
     if (req.method === 'POST' && path === '/api/bili-duty/config') {
       const body = await readBody(req)
       const patch = {}
       for (const k of ['perDay', 'peakValley', 'noon', 'night', 'autoComment', 'transcribe', 'asrModel',
         'commentPerRound', 'mentionName', 'dmMode', 'dmUid',
-        'keywords', 'pythonPath', 'dshBin', 'headlessProfile', 'workspace', 'reportLevel', 'replyToComments', 'replyPerRound']) {
+        'keywords', 'pythonPath', 'dshBin', 'headlessProfile', 'workspace', 'reportLevel', 'replyToComments', 'replyPerRound', 'personaEvolve']) {
         if (k in body) patch[k] = body[k]
       }
       // ⭐ 范围钳制 + 两份都写（config.json / DSH 原生设置页），统一走 persistCfg —— 见文件上方

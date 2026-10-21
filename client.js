@@ -160,6 +160,7 @@ window.__ModuleLoader__.load({
       const [login, setLogin] = React.useState(null)
       const [runNote, setRunNote] = React.useState(null)
       const [report, setReport] = React.useState(null)        // 非 null = 报告已展开   // 顶部那行状态（跑一轮/装依赖的反馈原来在最底下，看不见）
+      const [pn, setPn] = React.useState(null)                 // 人格档案预览（null = 收起）
       const [loginState, setLoginState] = React.useState('')
       const [loginTone, setLoginTone] = React.useState('')
       /* ⚠️ 扫码轮询的 timer 必须能停：切走设置页后还在跑的话会在已卸载的组件上 setState，
@@ -356,8 +357,38 @@ window.__ModuleLoader__.load({
         finally { setBusy('') }
       }
 
-      const onFavToday = async () => {
-        setBusy('fav')
+      // ⭐ 人格档案：只读预览 / 回退 / 重置（写是那一轮自己写，设置页不直接改它）
+      const onShowPersona = async () => {
+        if (pn) { setPn(null); return }
+        setBusy('persona')
+        try {
+          const r = await jget('/persona')
+          if (!r || !r.ok) { say('读不到人格档案：' + ((r && r.error) || '未知原因'), 'warn'); return }
+          setPn(r)
+        } catch (e) { say(String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const onRollbackPersona = async () => {
+        setBusy('persona-rollback')
+        try {
+          const r = await jpost('/persona/rollback', {})
+          if (!r || !r.ok) { say((r && r.error) || '回退没成', 'warn'); return }
+          if (r.persona) setPn(r.persona)
+          say('人格档案回退好了：' + (r.note || '已恢复上一版'), 'good')
+        } catch (e) { say(String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const onResetPersona = async () => {
+        setBusy('persona-reset')
+        try {
+          const r = await jpost('/persona/reset', {})
+          if (!r || !r.ok) { say((r && r.error) || '重置没成', 'warn'); return }
+          if (r.persona) setPn(r.persona)
+          say('人格档案已重置为空白（旧的那份留在 .history 里，还能回退）', 'good')
+        } catch (e) { say(String(e?.message ?? e), 'warn') } finally { setBusy('') }
+      }
+
+      const onFavToday = async () => {        setBusy('fav')
         try {
           const r = await jpost('/fav-today', {})
           if (!r || r.ok === false) say('收藏没做成：' + ((r && r.error) || '未知原因'), 'warn')
@@ -521,6 +552,35 @@ window.__ModuleLoader__.load({
             st.asrTail ? h('div', null,
               h('div', { 'data-bd-note': '' }, st.asrInstalling ? '正在装转写依赖（进度）：' : '转写依赖的日志（末尾）—— 只有「没字幕的视频」用得到它：'),
               h('pre', { 'data-bd-pre': '' }, st.asrTail)) : null) : null),
+
+        /* ── 它自己的那份（人格档案）── */
+        h('div', { 'data-bd-sec': '' },
+          h('div', { 'data-bd-h': '' }, '它自己的那份（个性）'),
+          h(ToggleRow, {
+            label: '刷的时候顺便长个性',
+            note: '默认关。开了以后它会把「看过什么、吃哪一套、改过什么主意」记在自己的档案里 —— '
+              + '下一轮评论才像同一个人。只写它自己的档案，不动你写的 AGENTS.md。',
+            on: sw('personaEvolve'),
+            onChange: (v) => { patch({ personaEvolve: v }, '人格自进化'); if (!v) setPn(null) },
+          }),
+          sw('personaEvolve') ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-row': '' },
+              h('button', { 'data-bd-btn': '', disabled: busy === 'persona', onClick: onShowPersona },
+                pn ? '收起' : '看它现在是什么样'),
+              h('button', { 'data-bd-btn': '', disabled: Boolean(busy), onClick: onRollbackPersona }, '回退上一版'),
+              h('button', { 'data-bd-btn': '', disabled: Boolean(busy), onClick: onResetPersona }, '重置')),
+            h('div', { 'data-bd-note': '' },
+              '它每轮最多改 2 处；改得太猛、写太长、或者写了 @，宿主管家会自己回滚（记录在 duty.log）。'),
+            pn ? h('div', null,
+              h('div', { 'data-bd-note': '' },
+                `${pn.selfChars} / ${pn.max || 1200} 字 · 日记 ${pn.journalLines} 行 · 它说过的话 ${pn.saidLines} 条 · 快照 ${(pn.snapshots || []).length} 份`),
+              h('pre', { 'data-bd-pre': '' }, pn.text || '（还是空的）'),
+              pn.journalTail ? h('div', null,
+                h('div', { 'data-bd-note': '' }, '最近的日记：'),
+                h('pre', { 'data-bd-pre': '' }, pn.journalTail)) : null,
+              pn.changelogTail ? h('div', null,
+                h('div', { 'data-bd-note': '' }, '它改过的主意：'),
+                h('pre', { 'data-bd-pre': '' }, pn.changelogTail)) : null) : null) : null),
 
         /* ── 关注什么 / 在哪儿刷 ── */
         h('div', { 'data-bd-sec': '' },
