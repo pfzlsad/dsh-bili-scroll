@@ -51,11 +51,11 @@ async def add(bvid, fid):
     from bilibili_api import video as ba_video
     cred, _ = load()
     v = ba_video.Video(bvid=bvid, credential=cred)
-    info = await v.get_info()
-    aid = int(info['aid'])
-    res = await favorite_list.FavoriteList(aid, credential=cred).get_info()
     try:
-        await favorite_list.FavoriteListResource(aid, type_=2, credential=cred).add(fid)
+        # ⭐ 收藏走 Video.set_favorite(add_media_ids=[...])。
+        #   以前这里用的 favorite_list.FavoriteListResource 在这个版本的
+        #   bilibili-api-python 里根本不存在 ⇒ 每次 add 都是 NameError / AttributeError
+        res = await v.set_favorite(add_media_ids=[fid])
     except Exception as error:  # noqa: BLE001
         msg = str(error)
         # 已经收藏过不算失败
