@@ -1,5 +1,10 @@
 # dsh-bili-scroll ｜ 刷B站
 
+> ⚠️ **本仓库是二次修改版**：基于原作者 **[c1overzz/dsh-bili-scroll](https://github.com/c1overzz/dsh-bili-scroll)**
+> （MIT，Copyright (c) 2026 c1overzz）修改，保留原 `LICENSE` 与 `NOTICE.md` 的署名。
+> 相对原版的改动只有「自动收藏」的两处 bug 修复，明细见 [`NOTICE.md`](NOTICE.md)。
+> 上游仍是原作者那版，通用问题 / 新功能请看上游。
+
 > **先看三行**
 > - 需要 **dsh ≥ `0.1.7-rc.1`**（本机是 `0.1.7-rc.2`）。⚠️ 版本不满足时，**内核会静默跳过这个插件** —— 装了跟没装一样，不会报错。
 > - **空间**：不装「本地转写」约 **84 MB**；装了转写约 **1 GB**（其中 Whisper 模型 538 MB，可在设置里换更小的模型）。
