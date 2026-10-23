@@ -62,6 +62,18 @@ export const Config = !z ? undefined : z.object({
   dmMode: z.string().default('off').extra('volatile', true),
   /** ⭐ 私信发给谁的 UID（数字）。要在 dmMode 不是 off 时填 */
   dmUid: z.natural().default(0).extra('volatile', true),
+  /** ⭐ 看「指定用户」转发的视频（0 = 关）：他的转发动态 / 他私信分享给你的视频 */
+  watchUid: z.natural().default(0).extra('volatile', true),
+  /** 从哪儿看他转发的：dm=他私信分享的 · dynamic=他的转发动态 · both=都看 */
+  watchSource: z.string().default('dm').extra('volatile', true),
+  /** ⭐ 看完在私信里回复看法（会拿使用者的号发私信；watchUid=0 时整条功能不生效） */
+  watchReply: z.boolean().default(true).extra('volatile', true),
+  /** 每轮最多看几条他转发的 */
+  watchPerRound: z.natural().default(2).extra('volatile', true),
+  /** ⭐ 纯文字私信也回（宿主每 dmPollSeconds 秒看一次；默认开，但 watchUid=0 时不生效） */
+  watchText: z.boolean().default(true).extra('volatile', true),
+  /** 多久看一次私信（秒）；0 = 不轮询（只在刷B站那几轮里顺手回） */
+  dmPollSeconds: z.natural().default(120).extra('volatile', true),
   /** 本地转写（没字幕的视频用 Whisper 转；默认关，要下模型） */
   transcribe: z.boolean().default(false).extra('volatile', true),
   /** 本地转写用哪个 Whisper 模型（tiny / base / small / medium） */
@@ -203,6 +215,7 @@ export function apply(ctx, config) {
   const DEFAULTS = {
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
     dmMode: 'off', dmUid: 0,
+    watchUid: 0, watchSource: 'dm', watchReply: true, watchPerRound: 2, watchText: true, dmPollSeconds: 120,
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     personaEvolve: false,
   }
@@ -240,6 +253,17 @@ export function apply(ctx, config) {
     if ('favFolderId' in p) p.favFolderId = Math.max(0, Math.floor(Number(p.favFolderId) || 0))
     if ('commentPerRound' in p) p.commentPerRound = Math.max(0, Math.min(Number(p.commentPerRound) || 0, 20))
     if ('personaEvolve' in p) p.personaEvolve = Boolean(p.personaEvolve)
+    // ⭐ 「看指定用户转发的视频」：UID 非负整数；来源三选一；每轮 0–5 条；回复开关布尔
+    if ('watchUid' in p) p.watchUid = Math.max(0, Math.floor(Number(p.watchUid) || 0))
+    if ('watchSource' in p) p.watchSource = ['dm', 'dynamic', 'both'].includes(String(p.watchSource)) ? String(p.watchSource) : 'dm'
+    if ('watchReply' in p) p.watchReply = Boolean(p.watchReply)
+    if ('watchPerRound' in p) p.watchPerRound = Math.max(0, Math.min(Number(p.watchPerRound) || 0, 5))
+    if ('watchText' in p) p.watchText = Boolean(p.watchText)
+    // 0 = 不轮询；否则 60–900 秒（太密会被 B站 限流，也太费钱）
+    if ('dmPollSeconds' in p) {
+      const n = Number(p.dmPollSeconds) || 0
+      p.dmPollSeconds = n <= 0 ? 0 : Math.max(60, Math.min(n, 900))
+    }
     return p
   }
 
@@ -581,6 +605,12 @@ export function apply(ctx, config) {
         autoComment: cfg.autoComment,
         dmMode: cfg.dmMode,
         dmUid: Number(cfg.dmUid) || 0,
+        watchUid: Number(cfg.watchUid) || 0,
+        watchSource: cfg.watchSource,
+        watchReply: Boolean(cfg.watchReply),
+        watchPerRound: Number(cfg.watchPerRound) || 0,
+        watchText: Boolean(cfg.watchText),
+        dmPollSeconds: Number(cfg.dmPollSeconds) || 0,
         transcribe: cfg.transcribe,
         loggedIn: hasCredential(),
         home: stateDir,
@@ -641,7 +671,10 @@ export function apply(ctx, config) {
     name: 'bili_config',
     description: '读 / 改「刷B站」的设置。不给 `patch` 就是读；给了就改（只认 schema 里的字段）。\n'
       + '例：`{"perDay":5,"peakValley":true,"noon":true,"night":true,"autoComment":false,"transcribe":false,"keywords":["DeepSeek Harness"]}`；'
-      + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）。',
+      + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）；'
+      + '看某人转发的视频并回私信：`{"watchUid":12345678,"watchSource":"both","watchReply":true,"watchPerRound":2}`'
+      + '（watchSource = dm / dynamic / both；watchUid=0 关闭）；'
+      + '连纯文字私信也回：`{"watchUid":12345678,"watchText":true,"dmPollSeconds":120}`。',
     parameters: { patch: { type: 'object', additionalProperties: true, description: '要改的字段（可省）' } },
     async execute(args) {
       let host = null
@@ -893,6 +926,11 @@ export function apply(ctx, config) {
     //    commentOn 是"这一轮到底能不能发公开评论"的唯一判据（工具层的闸用的是同一套逻辑）
     const commentOn = Boolean(cfg.autoComment && cfg.mentionName && cfg.dmMode !== 'only')
     const dmOn = Boolean(cfg.dmMode !== 'off' && Number(cfg.dmUid) > 0)
+    // ⭐ 2026-10-23：看「指定用户」转发的视频，并在私信里说看法（watchUid=0 ⇒ 整节不出现）
+    const watchUid = Number(cfg.watchUid) || 0
+    const watchOn = watchUid > 0
+    const watchSrc = String(cfg.watchSource || 'dm')
+    const watchPer = Math.max(1, Number(cfg.watchPerRound) || 2)
     return `你是这个账号的 B站 助手。`
       + `下面是使用者的设定（如果有）—— **按它来**，别用你默认那套人格。`
       + ownerDoc
@@ -959,6 +997,29 @@ export function apply(ctx, config) {
           + `⚠️ 私信里**不要**写"本鱼 / 本鲸 / 主人 / 人家"那套；⚠️ 发完把"已私信"记进报告（**报告里**可以写口径）。`
           + (cfg.dmMode === 'both' ? `⚠️ 现在是 **both**：公开评论照发（走下面那一整套规矩），私信**另外**再发一条。` : '')
         : '')
+      + (watchOn
+        ? `\n⭐⭐ **指定用户转发的视频（这一轮先做，别漏）**：看 UID **${watchUid}** 转发的视频 —— `
+          + (watchSrc === 'dm'
+            ? '来源是**他私信分享给你的视频**（bili_shared_videos）。'
+            : watchSrc === 'dynamic'
+              ? '来源是**他的转发动态**（bili_user_forwards）。'
+              : '来源是**他私信分享的视频 + 他的转发动态**（bili_shared_videos 和 bili_user_forwards 都扫一遍）。')
+          + `（这是**独立的一小块**，跟上面的日报 / 私信投递互不影响；这里**只跟 UID ${watchUid} 说话**，别发错人。）`
+          + `\n① 取最近几条（num 至少 ${Math.max(6, watchPer * 3)}），先拿判重表对一遍：**标了 \`[转发]\` 的 BV 号不要再碰**（回过的、跳过的都算）。这一轮最多看 **${watchPer}** 条。`
+          + `\n② 每条**先读字幕原文**（bili_subtitle）再下结论${cfg.transcribe ? '；没字幕就按章程用本机转写' : ''}。**没字幕时不许凭标题猜内容**，但**也不能装没看见**：给他回一句实话（「这条没字幕，我读不到它讲了啥」）+ 你从封面 / 评论区能确认的一两个点，别编。`
+          + (cfg.watchReply
+            ? `\n③ 回之前**先读一眼你俩最近的私信**（bili_dm_history(uid=${watchUid})）—— 他可能已经说过什么，别答非所问、也别把上一轮的话再说一遍。`
+              + `\n④ 看完用 **bili_send_message(receiver_uid=${watchUid}, text=…)** 回给他：**一条视频一条私信**，120–400 字（**硬上限 500 字符，超了接口会拒**）。`
+              + `内容要像**朋友之间聊视频**：一个只有真看了才写得出的细节 + 你自己的看法（喜欢哪、不认同哪），结尾可以带一句真问题。`
+              + `🔴 **不许**写成「这期值得看：标题 + 链接」那种清单 ✗；**不许**出现任何设置名 / 内部术语（watchUid、判重表、本轮、工具名…）✗；`
+              + `**不许 @ 任何人**、**不许**把日报的统计口径搬进去、**更不许**冒充使用者本人替他表态 —— 用你自己的口吻说。`
+              + `⚠️ 被拒（如 21007）就**精简一次**重发，别原样连发。`
+            : `\n③ 这一轮**不要在私信里回复**（设置里关着）—— 只把看法写进报告。`)
+          + `\n⑤ 报告里单独一节 \`## 朋友转发的\`，每条写 \`- BV号 · 标题 · 一句看法 · 回没回私信\`。`
+          + `🔴 **这些视频不要用 \`### BV号\` 当标题** —— 宿主会把 \`###\` 行算成「今天挑中」，白白吃掉额度 ✗。`
+          + `\n⑥ 每条都记进判重表（带 \`[转发]\` 前缀）：\`- 月-日 · [转发] BV号 · 标题 · 已回私信 / 跳过（原因）\`。`
+          + `⚠️ 接口取不到 / 报错就如实写一行，别重试轰炸。`
+        : '')
       + (cfg.replyToComments
         ? `回复评论：开着（每轮最多回 ${Number(cfg.replyPerRound) || 1} 条）—— 只回「直接回复到你那条评论下面的人」，回完记进报告；找不到你那条评论就跳过，别硬找。`
         : `回复评论：关着（一个字都不要回任何人 —— 有人回复你那条评论也不要理）。`)
@@ -987,11 +1048,23 @@ export function apply(ctx, config) {
     //   模型手里压根没有这只工具 ⇒ 表现成"开关也开了、这一轮也跑了，但从来没发出去过" ✗
     //   ⇒ dmMode 不是 off、且填了收件人 UID 才放进去（关着就不给，白名单别松）
     if (String(cfg.dmMode || 'off') !== 'off' && Number(cfg.dmUid) > 0) list.push('bili_send_message')
-    return list
+    // ⭐ 2026-10-23「看指定用户转发的视频 + 私信里说看法」：默认关（watchUid=0），开了才给这几只。
+    //    和 dmMode 那套互不影响 —— 这里的私信是**回给转发视频的那个人**，不是投递日报。
+    const watchUid = Number(cfg.watchUid) || 0
+    if (watchUid > 0) {
+      const src = String(cfg.watchSource || 'dm')
+      if (src === 'dm' || src === 'both') list.push('bili_shared_videos')
+      if (src === 'dynamic' || src === 'both') list.push('bili_user_forwards')
+      list.push('bili_dm_history')
+      if (cfg.watchReply) list.push('bili_send_message')
+    }
+    return [...new Set(list)]
   }
 
-  const ensureOverlay = () => {
-    const file = join(stateDir, 'headless-overlay.yml')
+  const ensureOverlay = (opts = {}) => {
+    const file = join(stateDir, opts.file || 'headless-overlay.yml')
+    // ⭐ 私信小回合只给两只工具（读上下文 / 发私信），别让它顺手去搜视频、发评论
+    const tools = Array.isArray(opts.tools) && opts.tools.length ? opts.tools : mcpWhitelist()
     const script = join(stateDir, 'mcp_server.py')
     const posix = (p) => String(p).replace(/\\/g, '/')
     const yml = []
@@ -1038,7 +1111,7 @@ export function apply(ctx, config) {
         '        args:',
         `          - '${posix(script)}'`,
         '        env:',
-        `          BILI_MCP_TOOLS: '${mcpWhitelist().join(',')}'`,
+        `          BILI_MCP_TOOLS: '${tools.join(',')}'`,
         '',
       )
     }
@@ -1101,6 +1174,8 @@ export function apply(ctx, config) {
     } catch (e) { log(`补占位报告失败：${e?.message ?? e}`) }
   }
 
+  // ⭐ 私信小回合和刷B站那一轮互斥：别同时拿同一个号发两拨消息
+  let dutyRunning = false
   const runDuty = (why = 'window') => {
    try {
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
@@ -1156,7 +1231,9 @@ export function apply(ctx, config) {
     }
     child.stdout?.on('data', pick)
     child.stderr?.on('data', pick)
+    dutyRunning = true
     child.on('exit', (code) => {
+      dutyRunning = false
       log(`刷B站结束（${why}，code=${code}）`)
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
       // ⭐ 人格档案：模型再飘也飘不出边界 —— 太长 / 改太猛 / 写了 @ / 结构被拆 ⇒ 回滚
@@ -1185,13 +1262,138 @@ export function apply(ctx, config) {
       const verifyTimer = setTimeout(() => { Promise.resolve(runVerify('round')).catch((e) => log('复核异常：' + (e?.message ?? e))) }, 90_000)
       verifyTimer.unref?.()   // 别为了一次复核把宿主进程的退出拖住 90 秒
     })
-    child.on('error', (e) => log(`刷B站起不来：${e?.message ?? e}`))
+    child.on('error', (e) => { dutyRunning = false; log(`刷B站起不来：${e?.message ?? e}`) })
     return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile }
    } catch (e) {
     log(`刷B站开跑失败（${why}）：${e?.stack ?? e}`)
     return { started: false, why, error: String(e?.message ?? e) }
    }
   }
+
+  /* ─────────────── 私信小回合（纯文字 + 新分享的视频，2026-10-23 加）───────────────
+   * 为什么单独起一个小回合、而不是等「刷一轮」：
+   *   刷一轮是中午 / 晚上的谷时批次，使用者发一句「你好」、分享一条视频，要等到下一批才有人理 —— 那不叫对话。
+   * 做法：宿主每 dmPollSeconds 秒问一次「有没有他发的、我还没回的文字 / 还没回过的视频」，
+   *   有 ⇒ 起一个小的 headless 回合：文字回一条、视频一条一条回，回完就结束。
+   * 边界：① 只认 watchUid 这一个人；② 文字用过闸的 bili_dm_reply（最后一条是自己回的就拒绝）；
+   *   视频按判重表去重（seen.md 里出现过的 BV 不再回）。
+   *   ③ 和刷B站那一轮互斥；④ 一次最多回 watchPerRound 条视频。
+   */
+  let chatBusy = false
+  let lastDmCheck = 0
+  // ⭐ 分享的视频也要及时回：记一下「刚试过的 BV」—— 万一模型没写成判重表，也别 2 分钟一次反复轰
+  const shareTried = new Map()
+  const seenBvids = () => {
+    const set = new Set()
+    try {
+      const t = readFileSync(join(stateDir, 'seen.md'), 'utf8')
+      for (const m of t.matchAll(/BV[0-9A-Za-z]{10}/g)) set.add(m[0])
+    } catch { /* 读不到就当空的：宁可多回一次，也别漏 */ }
+    return set
+  }
+
+  const chatPrompt = (uid, pending = [], videos = []) => {
+    const list = (pending || []).map((m, i) => `${i + 1}. ${String(m.text || '').replace(/\s+/g, ' ').slice(0, 200)}`).join('\n')
+    const vlist = (videos || []).map((v, i) => `${i + 1}. ${v.bvid} · ${String(v.title || '').slice(0, 60)}${v.author ? `（UP：${v.author}）` : ''}`).join('\n')
+    return `你是这个账号的 B站 助手，现在做一件小事：把对方（UID ${uid}）刚发来的东西接住。`
+      + (list ? `\n\n他**还没被回的纯文字消息**：\n${list}` : '')
+      + (vlist ? `\n\n他**刚分享、你还没回过的视频**：\n${vlist}` : '')
+      + `\n\n先看一眼上下文：bili_dm_history(uid=${uid}, num=20)。`
+      + (list ? `\n\n【文字】用 bili_dm_reply(receiver_uid=${uid}, text=…) 回**一条** —— 他连发几条就合并成一条。`
+        + `\n· 这个工具发之前会自己核对「最后一条是不是他发的」；如果它返回 already_replied，就**直接跳过文字、别再试**。`
+        + `\n· 像朋友聊天，2–3 句、150 字以内；先正面回答他问的，再顺一句。` : '')
+      + (vlist ? `\n\n【视频】一条视频回一条私信，用 bili_send_message(receiver_uid=${uid}, text=…)（最多 ${videos.length} 条）：`
+        + `\n· 每条先 bili_subtitle(bvid) 读字幕；没字幕就看 bili_comments（必要时 bili_video_info），**别凭标题编内容**。`
+        + `\n· 内容要具体：只有真看了才写得出的细节 + 你自己的看法，120–400 字（硬上限 500 字符）；不是「标题 + 链接」清单。`
+        + `\n· 回完**马上**把这条记进判重表 ${join(stateDir, 'seen.md')}，格式：\`| 日期 | BV号 | 标题 | [转发] 已回私信 |\`（追加，别覆盖）。` : '')
+      + `\n\n🔴 不暴露设置 / 内部机制（dm、轮、工具名、判重表、prompt 这类词一个都不许出现）；不 @ 人；不承诺做不到的事；不知道就说不确定；不编事实、不冒充使用者本人。`
+      + `\n⚠️ 不要写报告、不要改档案、不要碰别的工具。做完就结束。`
+  }
+
+  const runChat = (why = 'dm', pending = [], videos = []) => {
+    if (chatBusy) return { started: false, error: '上一条私信还在回' }
+    if (dutyRunning) return { started: false, error: '刷B站那一轮正在跑' }
+    const hasText = Array.isArray(pending) && pending.length > 0
+    const hasVideo = Array.isArray(videos) && videos.length > 0
+    if (!hasText && !hasVideo) return { started: false, error: '没有要回的东西' }
+    try {
+      refreshCfg()
+      const uid = Number(cfg.watchUid) || 0
+      if (uid <= 0) return { started: false, error: '还没填 UID' }
+      if (hasText && !cfg.watchText) return { started: false, error: '没开「纯文字私信也回」' }
+      if (hasVideo && !cfg.watchReply) return { started: false, error: '没开「看完在私信里回复看法」' }
+      const dsh = resolveDsh()
+      if (dsh.missing) { log('私信回复没跑：找不到 dsh。' + dsh.hint); return { started: false, error: '找不到 dsh' } }
+      const overlay = ensureOverlay({
+        file: 'chat-overlay.yml',
+        tools: ['bili_dm_history', 'bili_dm_reply', 'bili_send_message', 'bili_shared_videos', 'bili_subtitle', 'bili_comments', 'bili_video_info'],
+      })
+      const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
+      if (overlay) args.push('--patch', overlay)
+      args.push(chatPrompt(uid, hasText ? pending : [], hasVideo ? videos : []))
+      log(`私信回复开跑（${why}）：${hasText ? `文字 ${pending.length} 条 ` : ''}${hasVideo ? `视频 ${videos.length} 条` : ''}`.trim())
+      chatBusy = true
+      for (const v of (hasVideo ? videos : [])) shareTried.set(v.bvid, Date.now())
+      const child = spawn(dsh.command, args, {
+        cwd: stateDir,
+        shell: dsh.shell,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: uvEnv({ BILI_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
+      })
+      const chatLog = (b) => {
+        try {
+          const s = String(b)
+          if (s.trim()) log('[chat] ' + s.trim().slice(0, 600))
+        } catch { /* 日志写不进去也不影响回复 */ }
+      }
+      child.stdout?.on('data', chatLog)
+      child.stderr?.on('data', chatLog)
+      child.on('exit', (code) => { chatBusy = false; log(`私信回复结束（code=${code}）`) })
+      child.on('error', (e) => { chatBusy = false; log(`私信回复起不来：${e?.message ?? e}`) })
+      return { started: true, uid }
+    } catch (e) {
+      chatBusy = false
+      log(`私信回复开跑失败：${e?.message ?? e}`)
+      return { started: false, error: String(e?.message ?? e) }
+    }
+  }
+
+  // ⭐ 30 秒一跳、按 cfg.dmPollSeconds 节流 —— 这样设置页改了间隔立刻生效，不用重启
+  const dmTick = async () => {
+    try {
+      refreshCfg()
+      const uid = Number(cfg.watchUid) || 0
+      const every = Number(cfg.dmPollSeconds) || 0
+      if (uid <= 0 || every <= 0) return
+      if (!cfg.watchText && !cfg.watchReply) return
+      if (chatBusy || dutyRunning || !hasCredential()) return
+      if (Date.now() - lastDmCheck < every * 1000) return
+      lastDmCheck = Date.now()
+      const [p, s] = await Promise.all([
+        cfg.watchText ? call('bili_dm_pending', { uid, num: 10 }).catch(() => null) : Promise.resolve(null),
+        cfg.watchReply ? call('bili_shared_videos', { uid, num: 10 }).catch(() => null) : Promise.resolve(null),
+      ])
+      const pending = (p && Array.isArray(p.pending)) ? p.pending : []
+      const seen = seenBvids()
+      const per = Math.max(1, Number(cfg.watchPerRound) || 2)
+      const fresh = ((s && Array.isArray(s.items)) ? s.items : [])
+        .filter((v) => v && v.bvid && !seen.has(v.bvid))
+        .filter((v) => { const t = shareTried.get(v.bvid); return !t || Date.now() - t > 30 * 60 * 1000 })
+        .slice(0, per)
+      if (pending.length || fresh.length) {
+        log(`私信轮询：文字 ${pending.length} 条 / 新视频 ${fresh.length} 条，起一个小回合`)
+        runChat('poll', pending, fresh)
+      }
+    } catch (e) {
+      log(`私信轮询出错（已兜住）：${e?.message ?? e}`)
+    }
+  }
+  try {
+    const dmTimer = setInterval(() => { Promise.resolve(dmTick()).catch(() => {}) }, 30_000)
+    dmTimer.unref?.()
+    ctx.effect(() => () => clearInterval(dmTimer), 'bili-duty: 私信轮询')
+  } catch (e) { log(`私信轮询没起来：${e?.message ?? e}`) }
 
   /* ─────────────── 谷时定时器 ───────────────
    * 🔴 2026-10-14 事故（使用者那边表现为"DSH 突然崩了、网页 Failed to fetch (gateway/internal)"）：
@@ -1203,6 +1405,7 @@ export function apply(ctx, config) {
     try {
       refreshCfg()                    // ⭐ 定时器活得比设置页久：每一跳都重新读一遍配置
       if (!cfg.peakValley) return
+      if (chatBusy) return            // 私信小回合正在回：别同时再起一轮（同一个号会发两拨消息）
       const now = new Date()
       const st = readJson(dutyStateFile, {})
       const today = dayKey(now)
@@ -1664,6 +1867,7 @@ export function apply(ctx, config) {
       const patch = {}
       for (const k of ['perDay', 'peakValley', 'noon', 'night', 'autoComment', 'transcribe', 'asrModel',
         'commentPerRound', 'mentionName', 'dmMode', 'dmUid',
+        'watchUid', 'watchSource', 'watchReply', 'watchPerRound', 'watchText', 'dmPollSeconds',
         'keywords', 'pythonPath', 'dshBin', 'headlessProfile', 'workspace', 'reportLevel', 'replyToComments', 'replyPerRound', 'personaEvolve', 'favFolderId']) {
         if (k in body) patch[k] = body[k]
       }
@@ -1671,6 +1875,10 @@ export function apply(ctx, config) {
       // ⭐ 私信那两个字段的合法值（2026-10-17 摘 PR #9；其余范围钳制统一在 persistCfg 里）
       if ('dmMode' in patch) patch.dmMode = ['off', 'only', 'both'].includes(String(patch.dmMode)) ? String(patch.dmMode) : 'off'
       if ('dmUid' in patch) patch.dmUid = Math.max(0, Math.min(Number(patch.dmUid) || 0, Number.MAX_SAFE_INTEGER))
+      // ⭐ 看转发那几项：合法值 / 范围（和 clampPatch 同一个口径）
+      if ('watchUid' in patch) patch.watchUid = Math.max(0, Math.floor(Number(patch.watchUid) || 0))
+      if ('watchSource' in patch) patch.watchSource = ['dm', 'dynamic', 'both'].includes(String(patch.watchSource)) ? String(patch.watchSource) : 'dm'
+      if ('watchPerRound' in patch) patch.watchPerRound = Math.max(0, Math.min(Number(patch.watchPerRound) || 0, 5))
       const { clean, host } = await persistCfg(patch)
       log(`设置已更新：${JSON.stringify(clean)}（DSH 那边${host.ok ? '已同步' : '没写成：' + host.error}）`)
       return sendJson(res, 200, { ok: true, config: cfg, host })
@@ -1678,6 +1886,27 @@ export function apply(ctx, config) {
 
     if (req.method === 'POST' && path === '/api/bili-duty/run') {
       return sendJson(res, 200, { ok: true, ...runDuty('manual') })
+    }
+
+    // ⭐ 「现在回一条私信」：只用来手动试一下（正常是后台每 dmPollSeconds 自动看）
+    //    ⚠️ 也先查一遍「有没有真的没回的东西」—— 不然模型会对着已经回过的话再回一遍（实测撞过）
+    if (req.method === 'POST' && path === '/api/bili-duty/chat') {
+      const uid = Number(cfg.watchUid) || 0
+      if (uid <= 0) return sendJson(res, 200, { ok: false, error: '还没填「看谁的转发」UID' })
+      let pending = [], fresh = []
+      try {
+        const [p, s] = await Promise.all([
+          cfg.watchText ? call('bili_dm_pending', { uid, num: 10 }) : Promise.resolve(null),
+          cfg.watchReply ? call('bili_shared_videos', { uid, num: 10 }) : Promise.resolve(null),
+        ])
+        pending = (p && Array.isArray(p.pending)) ? p.pending : []
+        const seen = seenBvids()
+        fresh = ((s && Array.isArray(s.items)) ? s.items : [])
+          .filter((v) => v && v.bvid && !seen.has(v.bvid))
+          .slice(0, Math.max(1, Number(cfg.watchPerRound) || 2))
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) }) }
+      if (!pending.length && !fresh.length) return sendJson(res, 200, { ok: true, started: false, reason: '没有没回的文字 / 新视频，不用回' })
+      return sendJson(res, 200, { ok: true, ...runChat('manual', pending, fresh) })
     }
 
     // 建 venv + 装依赖（**不等它**：几分钟的活，进度写 install.log）

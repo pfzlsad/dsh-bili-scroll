@@ -47,7 +47,9 @@
 - `lib/` —— 状态目录与家目录 / 极小的 MCP stdio 客户端 / 扫码登录 / **`hostdeps.mjs`（从宿主树取 `@deepseek-ai/*`，拿不到就退到自己依赖 / 本地等价实现）** / **`verify.mjs`（评论发出后复核）** / **`persona.mjs`（人格档案：铺模板、快照、校验回滚、记 `said.md`）**
 - `prompts/duty.md` —— 一轮要做的事（判定口径 + 红线，**用户可以改**）；升级规矩见 `lib/state.mjs` 的 `ensureCharter`（用户改过 ⇒ 保留他那份、新版落 `duty.md.new`）
   · ⚠️ 正因为它可改，**「人格维护」的要点也写进了 `index.js` 的开头提示词**（`promptFor` 里那段）—— 用户那章程不会自动带上新章节
-- `vendor/bilibili-mcp/` —— 内置的 Python MCP（MIT，AGI_Ananas）
+- `vendor/bilibili-mcp/` —— 内置的 Python MCP（MIT，AGI_Ananas）；0.3.0 起我们在它上面加了
+  `bili_user_forwards` / `bili_shared_videos` / `bili_dm_history` 三只（看朋友转发的视频 + 读私信上下文）。
+  **重新 vendor 上游时必须原样补回来**（文件开头那段清单也记着这件事）
 - `selfcheck.mjs` + `tools/` —— 本地预检：`node selfcheck.mjs`（**现在不用解析钩子了**；`tools/register.mjs` 那条还留着当备份）
 
 ## 约定

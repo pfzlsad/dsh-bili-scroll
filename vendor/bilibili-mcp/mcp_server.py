@@ -1410,6 +1410,334 @@ async def bili_received_at_and_likes() -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+# ========== Tool 25/26/27: 朋友转发的视频 + 私信上下文 ==========
+#   起因（2026-10-23）：使用者想要「看指定用户转发的视频，并在私信里说看法」。
+#   两种「转发」都支持：
+#     ① 他**转发动态**里带的那条视频（bili_user_forwards）
+#     ② 他**私信分享给我的**视频（bili_shared_videos）
+#   `bili_dm_history` 用来在回复前读一眼上下文 —— 别答非所问、也别把同一句话说两遍。
+
+# 分享卡片只有 aid —— 反查过的 bvid 缓存起来（宿主每 2 分钟轮询一次，别每次都去问 B站）
+_AID2BVID: dict = {}
+
+
+def _to_int(v) -> int:
+    """B站 的播放量常是 '12.4万' 这种字符串 —— 别让一个统计字段把整只工具弄挂。"""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v or "").strip().replace(",", "")
+    mult = 1
+    if s.endswith("万"):
+        mult, s = 10000, s[:-1]
+    elif s.endswith("亿"):
+        mult, s = 100000000, s[:-1]
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        return 0
+
+
+def _video_from_forward(item: dict) -> dict | None:
+    """从一条「转发动态」里取出被转发的视频；转的不是视频就返回 None。"""
+    orig = item.get("orig")
+    if not isinstance(orig, dict):
+        return None
+    if (orig.get("type") or "") != "DYNAMIC_TYPE_AV":
+        return None
+    mods = orig.get("modules") or {}
+    md = mods.get("module_dynamic") or {}
+    archive = ((md.get("major") or {}).get("archive") or {})
+    bvid = (archive.get("bvid") or "").strip()
+    if not bvid:
+        return None
+    author = mods.get("module_author") or {}
+    stat = archive.get("stat") or {}
+    return {
+        "bvid": bvid,
+        "title": archive.get("title") or "",
+        "desc": (archive.get("desc") or "")[:400],
+        "cover": archive.get("cover") or "",
+        "duration": _to_int(archive.get("duration")),
+        "up_name": author.get("name") or "",
+        "play": _to_int(stat.get("play")),
+        "video_pub_ts": _to_int(author.get("pub_ts")),
+    }
+
+
+@tool()
+async def bili_user_forwards(uid: int, num: int = 10) -> str:
+    """
+    获取指定用户「转发动态」里的视频（他转发了哪些视频）
+
+    只保留真正转到视频的那几条；转的是专栏 / 图片 / 投票等不算。
+
+    Args:
+        uid: 用户 UID
+        num: 最多返回几条（默认 10，最大 50）
+
+    Returns:
+        JSON：{uid, count, items:[{bvid,title,up_name,forward_ts,forward_text,
+              video_pub_ts,play,duration,link,...}]}
+    """
+    cred = get_cred()
+    try:
+        want = max(1, min(int(num or 10), 50))
+        out, seen = [], set()
+        pn = 1
+        while len(out) < want and pn <= 4:
+            res = await dynamic.get_dynamic_page_info(cred, host_mid=int(uid), pn=pn)
+            items = (res or {}).get("items") or []
+            if not items:
+                break
+            for it in items:
+                if (it.get("type") or "") != "DYNAMIC_TYPE_FORWARD":
+                    continue
+                v = _video_from_forward(it)
+                if not v or v["bvid"] in seen:
+                    continue
+                seen.add(v["bvid"])
+                mods = it.get("modules") or {}
+                author = mods.get("module_author") or {}
+                md = mods.get("module_dynamic") or {}
+                v["dynamic_id"] = it.get("id_str") or ""
+                v["forward_ts"] = _to_int(author.get("pub_ts"))
+                v["forward_text"] = ((md.get("desc") or {}).get("text") or "")[:400]
+                v["link"] = "https://www.bilibili.com/video/" + v["bvid"]
+                out.append(v)
+                if len(out) >= want:
+                    break
+            if not (res or {}).get("has_more"):
+                break
+            pn += 1
+        return json.dumps({"uid": int(uid), "count": len(out), "items": out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e), "uid": int(uid)}, ensure_ascii=False)
+
+
+def _parse_dm(m: dict, self_uid: int) -> dict:
+    """把一条私信消息压成「人看得懂」的样子（文本 / 分享的视频 / 图片）。"""
+    mt = int(m.get("msg_type") or 0)
+    try:
+        c = json.loads(m.get("content") or "{}")
+    except Exception:
+        c = {}
+    msg = {
+        "from": "me" if int(m.get("sender_uid") or 0) == self_uid else "them",
+        "ts": _to_int(m.get("timestamp")),
+        "msg_type": mt,
+        "text": "",
+    }
+    if mt == 1:
+        msg["text"] = (c.get("content") or "").strip()
+    elif mt in (7, 11):
+        bvid = (c.get("bvid") or "").strip()
+        msg["video"] = {
+            "bvid": bvid,
+            "title": c.get("title") or "",
+            "aid": c.get("id") or 0,
+            "link": ("https://www.bilibili.com/video/" + bvid) if bvid else "",
+        }
+        msg["text"] = "[分享了视频]"
+    elif mt in (2, 6):
+        msg["text"] = "[图片]"
+    elif mt == 5:
+        msg["text"] = "[撤回了一条消息]"
+    else:
+        msg["text"] = f"[消息类型 {mt}]"
+    return msg
+
+
+@tool()
+async def bili_shared_videos(uid: int = 0, num: int = 10) -> str:
+    """
+    获取别人「私信分享 / 转发给我」的视频
+
+    Args:
+        uid: 只看这位用户（0 = 最近有私信往来的所有人）
+        num: 最多返回几条（默认 10，最大 50）
+
+    Returns:
+        JSON：{uid, count, items:[{bvid,title,talker_id,from_uid,ts,unread,link}]}
+    """
+    cred = get_cred()
+    try:
+        self_uid = int(getattr(cred, "dedeuserid", 0) or 0)
+        want = max(1, min(int(num or 10), 50))
+        target = int(uid or 0)
+        out, seen = [], set()
+        # 指定了人 ⇒ 直接读这条会话（比先列会话更稳：会话列表不一定列全）
+        if target > 0:
+            talkers = [{"talker_id": target, "unread_count": 0}]
+        else:
+            res = await session.get_sessions(credential=cred, session_type=1)
+            data = res.get("data") if isinstance(res.get("data"), dict) else res
+            talkers = [s for s in ((data or {}).get("session_list") or []) if int(s.get("talker_id") or 0) > 0][:20]
+        for s in talkers:
+            talker = int(s.get("talker_id") or 0)
+            if talker <= 0:
+                continue
+            detail = await session.fetch_session_msgs(talker_id=talker, credential=cred)
+            for m in ((detail or {}).get("messages") or []):
+                if int(m.get("msg_type") or 0) != 7:
+                    continue
+                if int(m.get("sender_uid") or 0) == self_uid:
+                    continue  # 自己分享出去的不算
+                try:
+                    c = json.loads(m.get("content") or "{}")
+                except Exception:
+                    c = {}
+                # ⚠️ 2026-10-23 实测：现在的分享卡片**只带 aid（id）+ title + author，不带 bvid** ——
+                #    只认 bvid 会把整条私信漏掉（用户当场就撞上了：分享了两条，一条都没被看到）。
+                #    ⇒ 没 bvid 就拿 aid 反查一次。
+                bvid = (c.get("bvid") or "").strip()
+                aid = _to_int(c.get("id"))
+                title = c.get("title") or ""
+                if not bvid and aid:
+                    bvid = _AID2BVID.get(aid, "")
+                    if not bvid:
+                        try:
+                            info = await video.Video(aid=aid).get_info()
+                            bvid = (info.get("bvid") or "").strip()
+                            title = title or (info.get("title") or "")
+                            if bvid:
+                                _AID2BVID[aid] = bvid
+                        except Exception:
+                            bvid = ""
+                if not bvid:
+                    continue
+                key = (bvid, _to_int(m.get("timestamp")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "bvid": bvid,
+                    "title": title,
+                    "author": c.get("author") or "",
+                    "aid": aid,
+                    "talker_id": talker,
+                    "from_uid": talker,
+                    "ts": _to_int(m.get("timestamp")),
+                    "unread": int(s.get("unread_count") or 0),
+                    "link": "https://www.bilibili.com/video/" + bvid,
+                })
+                if len(out) >= want:
+                    break
+            if len(out) >= want:
+                break
+        out.sort(key=lambda x: x["ts"], reverse=True)
+        return json.dumps({"uid": int(uid or 0), "count": len(out), "items": out[:want]}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e), "uid": int(uid or 0)}, ensure_ascii=False)
+
+
+@tool()
+async def bili_dm_history(uid: int, num: int = 20) -> str:
+    """
+    读和某位用户的最近私信（文本 + 分享的视频），回复前先看上下文
+
+    Args:
+        uid: 会话对象的 UID
+        num: 最近几条（默认 20，最大 50）
+
+    Returns:
+        JSON：{uid, count, messages:[{from,ts,msg_type,text,video?}]}（按时间从旧到新）
+    """
+    cred = get_cred()
+    try:
+        self_uid = int(getattr(cred, "dedeuserid", 0) or 0)
+        want = max(1, min(int(num or 20), 50))
+        detail = await session.fetch_session_msgs(talker_id=int(uid), credential=cred)
+        msgs = [_parse_dm(m, self_uid) for m in ((detail or {}).get("messages") or [])]
+        msgs.sort(key=lambda x: x["ts"])
+        msgs = msgs[-want:]
+        return json.dumps({"uid": int(uid), "count": len(msgs), "messages": msgs}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e), "uid": int(uid)}, ensure_ascii=False)
+
+
+@tool()
+async def bili_dm_pending(uid: int, num: int = 10) -> str:
+    """
+    看和某人的私信里「他发了、我还没回」的文字消息（宿主的私信轮询用）
+
+    Args:
+        uid: 会话对象的 UID
+        num: 最多返回几条（默认 10）
+
+    Returns:
+        JSON：{uid, last_from, pending_count, pending:[{from,ts,text}]}
+    """
+    cred = get_cred()
+    try:
+        self_uid = int(getattr(cred, "dedeuserid", 0) or 0)
+        detail = await session.fetch_session_msgs(talker_id=int(uid), credential=cred)
+        msgs = [_parse_dm(m, self_uid) for m in ((detail or {}).get("messages") or [])]
+        msgs.sort(key=lambda x: x["ts"])
+        pending = []
+        for m in reversed(msgs):          # 从最新往回走，碰到我自己发的那条就停
+            if m["from"] == "me":
+                break
+            pending.append(m)
+        pending.reverse()
+        texts = [m for m in pending if m.get("msg_type") == 1 and (m.get("text") or "").strip()]
+        return json.dumps({
+            "uid": int(uid),
+            "last_from": (msgs[-1]["from"] if msgs else ""),
+            "pending_count": len(texts),
+            "pending": texts[-max(1, min(int(num or 10), 30)):],
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e), "uid": int(uid)}, ensure_ascii=False)
+
+
+@tool()
+async def bili_dm_reply(uid: int, text: str) -> str:
+    """
+    回一条私信（**发之前先核对**：最后一条必须是他发的；已经回过就拒绝）
+
+    这是给「私信小回合」用的带闸版本：模型判断错了顺序也发不出重复消息。
+
+    Args:
+        uid: 对方 UID
+        text: 回复正文（≤500 字符）
+
+    Returns:
+        JSON：{success, message} 或 {success:false, refused, reason}
+    """
+    cred = get_cred()
+    body = (text or "").strip()
+    if not body:
+        return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
+    if len(body) > 500:
+        return json.dumps({"success": False, "error": "太长了：B站 私信实测上限 500 字符，精简一下"}, ensure_ascii=False)
+    try:
+        self_uid = int(getattr(cred, "dedeuserid", 0) or 0)
+        detail = await session.fetch_session_msgs(talker_id=int(uid), credential=cred)
+        msgs = [_parse_dm(m, self_uid) for m in ((detail or {}).get("messages") or [])]
+        msgs.sort(key=lambda x: x["ts"])
+        if msgs and msgs[-1]["from"] == "me":
+            return json.dumps({
+                "success": False,
+                "refused": "already_replied",
+                "reason": "最后一条已经是你发的了 —— 不重复回。直接结束。",
+            }, ensure_ascii=False)
+        r = await session.send_msg(
+            credential=cred,
+            receiver_id=int(uid),
+            msg_type=session.EventType.TEXT,
+            content=body,
+        )
+        return json.dumps({
+            "success": True,
+            "message": f"已回复 UID {int(uid)}",
+            "data": r if isinstance(r, dict) else str(r),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+
 # ========== 启动 ==========
 
 if __name__ == "__main__":

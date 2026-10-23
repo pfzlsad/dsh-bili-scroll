@@ -156,6 +156,9 @@ window.__ModuleLoader__.load({
       const [replyPer, setReplyPer] = React.useState(null)
       const [dmUid, setDmUid] = React.useState(null)        // 私信收件人 UID（本地草稿）
       const [dmMode, setDmMode] = React.useState(null)      // 投递方式：off / only / both
+      const [watchUid, setWatchUid] = React.useState(null)   // 看谁转发的（本地草稿）
+      const [watchSrc, setWatchSrc] = React.useState(null)   // dm / dynamic / both
+      const [watchPer, setWatchPer] = React.useState(null)   // 每轮最多看几条
       const [mention, setMention] = React.useState(null)
       const [login, setLogin] = React.useState(null)
       const [runNote, setRunNote] = React.useState(null)
@@ -183,6 +186,9 @@ window.__ModuleLoader__.load({
         if (cfg && mention === null) setMention(cfg.mentionName || '')
         if (cfg && dmUid === null) setDmUid(cfg.dmUid ? String(cfg.dmUid) : '')
         if (cfg && dmMode === null) setDmMode(cfg.dmMode || 'off')
+        if (cfg && watchUid === null) setWatchUid(cfg.watchUid ? String(cfg.watchUid) : '')
+        if (cfg && watchSrc === null) setWatchSrc(cfg.watchSource || 'dm')
+        if (cfg && watchPer === null) setWatchPer(String(cfg.watchPerRound ?? 2))
         if (cfg && favId === null) setFavId(String(cfg.favFolderId ?? 0))
       }, [cfg])
 
@@ -552,6 +558,56 @@ window.__ModuleLoader__.load({
             st.asrTail ? h('div', null,
               h('div', { 'data-bd-note': '' }, st.asrInstalling ? '正在装转写依赖（进度）：' : '转写依赖的日志（末尾）—— 只有「没字幕的视频」用得到它：'),
               h('pre', { 'data-bd-pre': '' }, st.asrTail)) : null) : null),
+
+        /* ── 看谁转发的视频（2026-10-23 新功能）── */
+        h('div', { 'data-bd-sec': '' },
+          h('div', { 'data-bd-h': '' }, '看谁转发的视频'),
+          h('div', { 'data-bd-label': '' }, '指定用户（B站 UID，数字）'),
+          h('input', {
+            'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 0, value: watchUid ?? '',
+            placeholder: '填这个人的数字 UID；留空 / 0 = 关掉',
+            onChange: (e) => setWatchUid(e.target.value),
+            onBlur: () => {
+              const n = Math.max(0, Math.floor(Number(watchUid) || 0))
+              setWatchUid(n ? String(n) : '')
+              patch({ watchUid: n }, '看谁的转发')
+            },
+          }),
+          h('div', { 'data-bd-note': '' },
+            '填了之后，它每轮会看这个人转发的视频（读字幕原文再判断），并在私信里跟他聊看法 —— 私信只发给这一个人，不会发到别处。'),
+          (Number(watchUid) || 0) > 0 ? h('div', { 'data-bd-sub': '' },
+            h('div', { 'data-bd-label': '' }, '从哪儿看他转发的'),
+            h('select', {
+              'data-bd-input': '', value: watchSrc ?? 'dm',
+              onChange: (e) => { setWatchSrc(e.target.value); patch({ watchSource: e.target.value }, '转发来源') },
+            },
+              h('option', { value: 'dm' }, '他的私信 — 他分享 / 转发给你的视频（默认）'),
+              h('option', { value: 'dynamic' }, '他的动态 — 他转发的视频动态'),
+              h('option', { value: 'both' }, '两边都看')),
+            h(ToggleRow, {
+              label: '看完在私信里回复看法',
+              note: '默认开（只在填了上面那个 UID 时生效）；它会把「具体看到了什么 + 自己的看法」回给对方，一条视频一条私信',
+              on: sw('watchReply'),
+              onChange: (v) => patch({ watchReply: v }, '私信回看法'),
+            }),
+            h(ToggleRow, {
+              label: '纯文字私信也回',
+              note: '默认开；后台大约每 2 分钟看一次私信，有新文字就回一条（像朋友聊天，一次只回一条）。会多花一点 token',
+              on: sw('watchText'),
+              onChange: (v) => patch({ watchText: v }, '纯文字私信'),
+            }),
+            h('div', { 'data-bd-row': '' },
+              h('div', { 'data-bd-grow': '' },
+                h('div', { 'data-bd-label': '' }, '每轮最多看几条'),
+                h('div', { 'data-bd-note': '' }, '看过的会记进判重表，不会反复回同一条')),
+              h('input', {
+                'data-bd-input': '', 'data-bd-num': '', type: 'number', min: 1, max: 5,
+                value: watchPer ?? '',
+                onChange: (e) => setWatchPer(e.target.value),
+                onBlur: () => { const n = Math.max(1, Math.min(Number(watchPer) || 2, 5)); setWatchPer(String(n)); patch({ watchPerRound: n }, '每轮看几条') },
+              })),
+            h('div', { 'data-bd-note': '' },
+              '⚠️ 建议先和这个人互关：B站 对「陌生人私信」会限流，还可能不弹提醒')) : null),
 
         /* ── 它自己的那份（人格档案）── */
         h('div', { 'data-bd-sec': '' },
